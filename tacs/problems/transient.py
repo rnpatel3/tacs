@@ -439,6 +439,7 @@ class TransientProblem(TACSProblem):
         self.assembler.setDesignVars(self.x)
         self.assembler.setNodes(self.Xpts)
 
+# Add new solver method that represents the N-B solve routine
     def solve(self):
         """
         Solve the time integrated transient problem. The
