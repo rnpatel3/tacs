@@ -439,46 +439,158 @@ class TransientProblem(TACSProblem):
         self.assembler.setDesignVars(self.x)
         self.assembler.setNodes(self.Xpts)
 
-# Add new solver method that represents the N-B solve routine
+# New solver method that represents the N-B solve routine
     def solve(self):
-        """
-        Solve the time integrated transient problem. The
-        forces must already be set.
-        """
-        startTime = time.time()
+        dt = 0.1 #Fixed val for now
+        # res = np.zeros((3,1))
+        # J = np.zeros((3, 3))
+        res = assembler.createVec()
+        J = assembler.createSchurMat()
+        
+        # forces = assembler.createVec()
+        # forces_array = forces.getArray()
+        # # print(forces_array)
+        # # forces_array[2::5] = 100
+        # forces_array[1::6] = -10
+        # #forces_array[1202:1322:6] = 100
+        # print(forces_array)
+        # assembler.applyBCs(forces)    
 
-        self.callCounter += 1
+        t = self.t                       # ??? What to do with the self references from old integration steps
+        
+        # Create the force vector
+        forces = assembler.createVec()
+        temp = assembler.createVec()
+        
+        # Set the compressive force
+        # forces_array = forces.getArray()
+        # forces_array[1::6] = -10
+        # assembler.applyBCs(forces)
 
-        setupProblemTime = time.time()
+        for i in range(0, self.N-1):
+            #u = np.ones((1,3)) #Some estimate of u[i+1]
+            
+            # if i < 2:
+            #         # Initial Perturbation force out of plane
+            #     forces_array = forces.getArray()
+            #     forces_array[1::6] = -10.0
+            #     forces_array[1202:1322:6] = 1000.0
+            #     assembler.applyBCs(forces)
+            # else:
+            #     forces_array = forces.getArray()
+            #     forces_array[1::6] = -10.0
+            #     forces_array[1202:1322:6] = 0.0
+            #     assembler.applyBCs(forces)
+            
+            # force_arr = forces.getArray()
+            # print(force_arr)
+            
+            u = assembler.createVec()
+            udot = assembler.createVec()
+            uddot = assembler.createVec()
+            
+            # uddot = (u - self.x[i])/(self.beta*dt**2) - self.xdot[i]/(self.beta*dt) - (1/(2*self.beta) - 1)* self.xddot[i] #Eq 5.42 based on this estimate
+            u.axpy(-1.0, self.x[i])
+            u.scale(1.0/self.beta*dt**2)
+            u.axpy(-1.0/(self.beta*dt), self.xdot[i])
+            u.axpy(-(1.0/(2*self.beta) - 1.0), self.xddot[i])
+            uddot.axpy(1,u)
+            
+            u = assembler.createVec() # Reset u for next calculation
+            
+            #udot = self.gamma*(u - self.x[i,:])/(self.beta*dt) + self.xdot[i,:]*(1-self.gamma/self.beta) + dt*self.xddot[i,:]*(1-self.gamma/(2*self.beta)) #Eq. 5.43 based on estimate
+            u.axpy(-1.0, self.x[i])
+            u.scale(self.gamma/(self.beta*dt))
+            u.axpy((1.0-self.gamma/self.beta), self.xdot[i])
+            u.axpy((dt*(1-self.gamma/(2*self.beta))), self.xddot[i])
+                   
+            u = assembler.createVec() #Reset u for the last time
+            #force = np.reshape(self.u[:,i+1], (1,3)) #Need to handle forces somehow into the "residual" again
 
-        # Set problem vars to assembler
-        self._updateAssemblerVars()
+            for j in range(self.newton_iters):
+                update = assembler.createVec()
+                tacs_alpha = 1.0
+                tacs_beta = self.gamma/(self.beta*dt) # Eq 5.43
+                tacs_gamma = 1.0/(self.beta*dt**2) # Eq 5.42    
+                
+                # assembler.assembleJacobian(tacs_alpha, tacs_beta, tacs_gamma,  force, res, J)
+                # rnorm = np.sqrt(np.dot(res.flatten(),res.flatten()))
+                assembler.assembleJacobian(tacs_alpha, tacs_beta, tacs_gamma, res, J)
+                pc = TACS.Pc(J)
+                pc.factor()
+                gmres_iters = 5
+                nrestart = 2
+                is_flexible = 1
+                gmres = TACS.KSM(J, pc, gmres_iters, nrestart, is_flexible)
+                
+                if i < 5:
+                    res.axpy(-t[i], forces)
+                else:
+                    res.axpy(-0.5, forces)
+                
+                if res.norm() < self.ntol:
+                    break
 
-        initSolveTime = time.time()
+                
+                #gmres.setMonitor(comm, freq=1)
+                gmres.solve(res, update)
+                
+                #Apply updates here
+                u.axpy(-1.0, update)
+                udot.axpy(-tacs_beta, update)
+                uddot.axpy(-tacs_gamma, update)
+                assembler.setVariables(u,udot,uddot)
 
-        # Loop over every time step and solve transient problem
-        for i in range(self.numSteps + 1):
-            # Set the auxilliary elements for this time step (tractions/pressures)
-            self.assembler.setAuxElements(self.auxElems[i])
-            self.integrator.iterate(i, forces=self.F[i])
+            #Store update to u, udot, uddot
 
-        solveTime = time.time()
+            self.x[i+1] = u
+            self.xdot[i+1] = udot
+            self.xddot[i+1] = uddot
 
-        # If timing was was requested print it, if the solution is nonlinear
-        # print this information automatically if prinititerations was requested.
-        if self.getOption('printTiming'):
-            self.pp('+--------------------------------------------------+')
-            self.pp('|')
-            self.pp('| TACS Solve Times:')
-            self.pp('|')
-            self.pp('| %-30s: %10.3f sec' % ('TACS Setup Time', setupProblemTime - startTime))
-            self.pp('| %-30s: %10.3f sec' % ('TACS Solve Init Time', initSolveTime - setupProblemTime))
-            self.pp('| %-30s: %10.3f sec' % ('TACS Solve Time', solveTime - initSolveTime))
-            self.pp('|')
-            self.pp('| %-30s: %10.3f sec' % ('TACS Total Solution Time', solveTime - startTime))
-            self.pp('+--------------------------------------------------+')
 
-        return
+        return self.x
+
+
+
+    # def solve(self):
+    #     """
+    #     Solve the time integrated transient problem. The
+    #     forces must already be set.
+    #     """
+    #     startTime = time.time()
+
+    #     self.callCounter += 1
+
+    #     setupProblemTime = time.time()
+
+    #     # Set problem vars to assembler
+    #     self._updateAssemblerVars()
+
+    #     initSolveTime = time.time()
+
+    #     # Loop over every time step and solve transient problem
+    #     for i in range(self.numSteps + 1):
+    #         # Set the auxilliary elements for this time step (tractions/pressures)
+    #         self.assembler.setAuxElements(self.auxElems[i])
+    #         self.integrator.iterate(i, forces=self.F[i])
+
+    #     solveTime = time.time()
+
+    #     # If timing was was requested print it, if the solution is nonlinear
+    #     # print this information automatically if prinititerations was requested.
+    #     if self.getOption('printTiming'):
+    #         self.pp('+--------------------------------------------------+')
+    #         self.pp('|')
+    #         self.pp('| TACS Solve Times:')
+    #         self.pp('|')
+    #         self.pp('| %-30s: %10.3f sec' % ('TACS Setup Time', setupProblemTime - startTime))
+    #         self.pp('| %-30s: %10.3f sec' % ('TACS Solve Init Time', initSolveTime - setupProblemTime))
+    #         self.pp('| %-30s: %10.3f sec' % ('TACS Solve Time', solveTime - initSolveTime))
+    #         self.pp('|')
+    #         self.pp('| %-30s: %10.3f sec' % ('TACS Total Solution Time', solveTime - startTime))
+    #         self.pp('+--------------------------------------------------+')
+
+    #     return
 
     ####### Function eval/sensitivity methods ########
 
